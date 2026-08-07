@@ -1,0 +1,69 @@
+# frozen_string_literal: true
+
+# -- copyright
+# OpenProject is an open source project management software.
+# Copyright (C) the OpenProject GmbH
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License version 3.
+#
+# OpenProject is a fork of ChiliProject, which is a fork of Redmine. The copyright follows:
+# Copyright (C) 2006-2013 Jean-Philippe Lang
+# Copyright (C) 2010-2013 the ChiliProject Team
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+# See COPYRIGHT and LICENSE files for more details.
+# ++
+
+require "spec_helper"
+
+RSpec.describe ColorsHelper do
+  let(:model) { Data.define(:id).new(5) }
+
+  describe "#hl_inline_class" do
+    it "returns the correct class name" do
+      expect(helper.hl_inline_class("foo_bar", model)).to eq("__hl_inline_foo_bar_5")
+    end
+  end
+
+  describe "#hl_background_class" do
+    it "returns the correct class name" do
+      expect(helper.hl_background_class("foo_bar", model)).to eq("__hl_background_foo_bar_5")
+    end
+  end
+
+  describe "#icon_for_color" do
+    context "with nil color" do
+      it "renders nothing" do
+        expect(helper.icon_for_color(nil)).to be_blank
+      end
+    end
+
+    context "with valid color" do
+      it "renders a color preview" do
+        expect(helper.icon_for_color(Color.new(hexcode: "#ff00ff"))).to be_html_eql %{
+          <span class="color--preview " style="background-color: #FF00FF;border-color: #80008050"> </span>
+        }.squish
+      end
+    end
+
+    context "with invalid color (invalid hexcode)" do
+      it "renders nothing" do
+        expect(helper.icon_for_color(Color.new(hexcode: "#ffXXff"))).to be_blank
+      end
+    end
+  end
+end

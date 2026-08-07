@@ -1,0 +1,19 @@
+<div class="wp-create-button">
+  <button
+    class="button -primary add-work-package"
+    [disabled]="disabled"
+    [attr.aria-label]="text.explanation"
+    opTypesCreateDropdown
+    [projectIdentifier]="projectIdentifier"
+    [stateName]="stateName$ | async"
+    [dropdownActive]="allowed"
+    [title]="text.title"
+    [routedFromAngular]="routedFromAngular"
+  >
+    <svg plus-icon size="small"/>
+    <span class="button--text"
+          [textContent]="text.createWithDropdown"
+          aria-hidden="true"></span>
+    <svg triangle-down-icon size="small"/>
+  </button>
+</div>
