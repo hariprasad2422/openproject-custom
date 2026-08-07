@@ -1,0 +1,91 @@
+# Production Docker Compose for OpenProject Community Edition.
+#
+# PostgreSQL deliberately does NOT appear here: it runs natively on the
+# Ubuntu host (systemd-managed, installed by deploy/scripts/setup-postgresql.sh)
+# and is reached over the fixed-subnet "openproject_net" Docker network via
+# host.docker.internal (see deploy/README.md for the full architecture).
+#
+# All openproject/openproject-* services use the custom image built by CI
+# from this repository's docker/prod/Dockerfile ("slim" target) - never the
+# public openproject/openproject image.
+name: openproject
+
+networks:
+  openproject_net:
+    external: true
+    name: ${DOCKER_NETWORK_NAME:-openproject_net}
+
+x-op-image: &op-image
+  image: ${IMAGE_NAME}:${IMAGE_TAG}
+
+x-op-common: &op-common
+  <<: *op-image
+  restart: unless-stopped
+  env_file:
+    - .env.prod
+  # Resolves to the fixed gateway IP of openproject_net (see
+  # prepare-server.sh), which is the only address PostgreSQL's pg_hba.conf
+  # accepts "openproject" role connections from.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - "${ASSETS_PATH:-/var/openproject/assets}:/var/openproject/assets"
+  networks:
+    - openproject_net
+
+services:
+  # Runs once per deployment: applies pending migrations (or loads the
+  # schema on a brand new database) and seeds base data, using OpenProject's
+  # own officially supported docker/prod/seeder script. web/worker wait for
+  # this to exit 0 before starting, so migrations never race a scaled web
+  # fleet.
+  seeder:
+    <<: *op-common
+    command: ["./docker/prod/seeder"]
+    restart: "no"
+
+  web:
+    <<: *op-common
+    command: ["./docker/prod/web"]
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+      cache:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health_checks/default"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  worker:
+    <<: *op-common
+    command: ["./docker/prod/worker"]
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+      cache:
+        condition: service_started
+
+  cache:
+    image: memcached:1.6-alpine
+    restart: unless-stopped
+    networks:
+      - openproject_net
+    # No published ports: only reachable from other containers on
+    # openproject_net.
+
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-80}:80"
+      - "${APP_HTTPS_PORT:-443}:443"
+    volumes:
+      - "./nginx/openproject.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "./nginx/certs:/etc/nginx/certs:ro"
+    depends_on:
+      - web
+    networks:
+      - openproject_net

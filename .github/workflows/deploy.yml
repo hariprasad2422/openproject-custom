@@ -1,0 +1,350 @@
+name: Deploy OpenProject to Production
+
+# Builds the OpenProject "slim" production image from THIS repository's
+# source (docker/prod/Dockerfile) and deploys it to a single Ubuntu 24.04
+# production server over SSH: OpenProject runs in Docker, PostgreSQL runs
+# natively on the host (systemd-managed). See deploy/README.md for the full
+# architecture and required secrets/variables.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+# Serializes deployments to the single production server - a second deploy
+# must wait for the first to finish rather than racing it or cancelling it
+# mid-flight (cancelling partway through a migration would be unsafe).
+concurrency:
+  group: openproject-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+  DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+  DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/openproject' }}
+  ASSETS_PATH: /var/openproject/assets
+  OPENPROJECT_HOST_NAME: ${{ vars.OPENPROJECT_HOST_NAME }}
+  OPENPROJECT_HTTPS: ${{ vars.OPENPROJECT_HTTPS || 'false' }}
+  APP_PORT: ${{ vars.APP_PORT || '80' }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'openproject-custom' }}
+  DB_NAME: ${{ vars.DB_NAME || 'openproject' }}
+  DB_USER: ${{ vars.DB_USER || 'openproject' }}
+  DOCKER_NETWORK_NAME: openproject_net
+  DOCKER_NETWORK_SUBNET: 172.28.1.0/24
+  DOCKER_NETWORK_GATEWAY: 172.28.1.1
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # ---------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Repository validation
+        run: |
+          set -euo pipefail
+          for f in \
+            docker/prod/Dockerfile \
+            docker/prod/web \
+            docker/prod/worker \
+            docker/prod/seeder \
+            docker/prod/entrypoint-slim.sh \
+            Gemfile \
+            lib/open_project/version.rb; do
+            if [ ! -e "$f" ]; then
+              echo "ERROR: expected file '$f' not found in checkout. Wrong repository/ref?" >&2
+              exit 1
+            fi
+          done
+          for f in \
+            deploy/docker-compose.prod.yml \
+            deploy/scripts/prepare-server.sh \
+            deploy/scripts/setup-postgresql.sh \
+            deploy/scripts/deploy.sh \
+            deploy/scripts/backup.sh \
+            deploy/scripts/rollback.sh \
+            deploy/scripts/health-check.sh; do
+            if [ ! -e "$f" ]; then
+              echo "ERROR: expected deployment file '$f' not found." >&2
+              exit 1
+            fi
+          done
+          echo "Repository looks valid."
+
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          OP_VERSION="$(ruby -e '
+            content = File.read("lib/open_project/version.rb")
+            major = content[/MAJOR\s*=\s*(\d+)/, 1]
+            minor = content[/MINOR\s*=\s*(\d+)/, 1]
+            patch = content[/PATCH\s*=\s*(\d+)/, 1]
+            puts "#{major}.#{minor}.#{patch}"
+          ')"
+          IMAGE_TAG="${{ github.run_number }}-${SHORT_SHA}"
+          echo "short_sha=${SHORT_SHA}" >>"$GITHUB_OUTPUT"
+          echo "op_version=${OP_VERSION}" >>"$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >>"$GITHUB_OUTPUT"
+          echo "Resolved OpenProject ${OP_VERSION}, image tag ${IMAGE_TAG}"
+
+      # ---------------------------------------------------------------
+      - name: Docker validation
+        run: |
+          set -euo pipefail
+          docker version
+          docker buildx version
+
+      - name: Build OpenProject image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --target slim \
+            --load \
+            --tag "${IMAGE_NAME}:${{ steps.meta.outputs.image_tag }}" \
+            --tag "${IMAGE_NAME}:latest" \
+            --file docker/prod/Dockerfile \
+            .
+          docker image inspect "${IMAGE_NAME}:${{ steps.meta.outputs.image_tag }}" >/dev/null
+
+      # ---------------------------------------------------------------
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
+            echo "ERROR: SSH_KNOWN_HOSTS secret is not set." >&2
+            echo "Generate it once with: ssh-keyscan -p \$DEPLOY_PORT \$DEPLOY_HOST" >&2
+            echo "We deliberately do not fall back to StrictHostKeyChecking=no." >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SERVER_SSH_KEY }}" >~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" >~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          {
+            echo "ssh_opts=-i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -p $DEPLOY_PORT"
+          } >>"$GITHUB_ENV"
+
+      - name: Test SSH
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "echo SSH connection OK"
+
+      - name: Prepare production server
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "sudo env DEPLOY_PATH='${DEPLOY_PATH}' ASSETS_PATH='${ASSETS_PATH}' DEPLOY_USER_NAME='${DEPLOY_USER}' DOCKER_NETWORK_NAME='${DOCKER_NETWORK_NAME}' DOCKER_NETWORK_SUBNET='${DOCKER_NETWORK_SUBNET}' DOCKER_NETWORK_GATEWAY='${DOCKER_NETWORK_GATEWAY}' bash -s" \
+            <deploy/scripts/prepare-server.sh
+
+      - name: Install/verify native PostgreSQL
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "sudo env PG_VERSION=17 bash -s -- install" \
+            <deploy/scripts/setup-postgresql.sh
+
+      - name: Configure PostgreSQL
+        env:
+          OPENPROJECT_DB_PASSWORD: ${{ secrets.OPENPROJECT_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OPENPROJECT_DB_PASSWORD" ]; then
+            echo "ERROR: OPENPROJECT_DB_PASSWORD secret is not set." >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "sudo env PG_VERSION=17 DB_NAME='${DB_NAME}' DB_USER='${DB_USER}' DOCKER_NETWORK_SUBNET='${DOCKER_NETWORK_SUBNET}' OPENPROJECT_DB_PASSWORD='${OPENPROJECT_DB_PASSWORD}' bash -s -- configure" \
+            <deploy/scripts/setup-postgresql.sh
+
+      - name: Test PostgreSQL
+        env:
+          OPENPROJECT_DB_PASSWORD: ${{ secrets.OPENPROJECT_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "sudo env PG_VERSION=17 DB_NAME='${DB_NAME}' DB_USER='${DB_USER}' OPENPROJECT_DB_PASSWORD='${OPENPROJECT_DB_PASSWORD}' bash -s -- verify" \
+            <deploy/scripts/setup-postgresql.sh
+
+      - name: Backup existing deployment
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "sudo env DEPLOY_PATH='${DEPLOY_PATH}' ASSETS_PATH='${ASSETS_PATH}' DB_NAME='${DB_NAME}' bash -s" \
+            <deploy/scripts/backup.sh
+
+      # ---------------------------------------------------------------
+      - name: Transfer Docker image
+        run: |
+          set -euo pipefail
+          docker save "${IMAGE_NAME}:${{ steps.meta.outputs.image_tag }}" | gzip >/tmp/openproject-image.tar.gz
+          ls -lh /tmp/openproject-image.tar.gz
+          # shellcheck disable=SC2086
+          scp $ssh_opts /tmp/openproject-image.tar.gz "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/openproject-image.tar.gz"
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "gunzip -c /tmp/openproject-image.tar.gz | docker load"
+
+      - name: Transfer deployment files
+        run: |
+          set -euo pipefail
+          # $DEPLOY_PATH is already owned by $DEPLOY_USER (prepare-server.sh),
+          # so no sudo/chown is needed for any of this.
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "mkdir -p '${DEPLOY_PATH}/scripts' '${DEPLOY_PATH}/nginx/certs' && chmod 750 '${DEPLOY_PATH}/nginx/certs'"
+          # shellcheck disable=SC2086
+          scp $ssh_opts \
+            deploy/docker-compose.prod.yml \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/docker-compose.prod.yml"
+          # shellcheck disable=SC2086
+          scp $ssh_opts \
+            deploy/scripts/deploy.sh \
+            deploy/scripts/backup.sh \
+            deploy/scripts/rollback.sh \
+            deploy/scripts/health-check.sh \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/scripts/"
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod +x '${DEPLOY_PATH}'/scripts/*.sh"
+          # shellcheck disable=SC2086
+          scp $ssh_opts \
+            deploy/nginx/openproject.conf.template \
+            deploy/nginx/openproject.conf.https.template \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/nginx/"
+          TEMPLATE=openproject.conf.template
+          if [ "$OPENPROJECT_HTTPS" = "true" ]; then
+            TEMPLATE=openproject.conf.https.template
+          fi
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "OPENPROJECT_HOST_NAME='${OPENPROJECT_HOST_NAME}' envsubst '\$OPENPROJECT_HOST_NAME' <'${DEPLOY_PATH}/nginx/${TEMPLATE}' >'${DEPLOY_PATH}/nginx/openproject.conf'"
+
+      - name: Generate production environment
+        env:
+          OPENPROJECT_DB_PASSWORD: ${{ secrets.OPENPROJECT_DB_PASSWORD }}
+          OPENPROJECT_SECRET_KEY_BASE: ${{ secrets.OPENPROJECT_SECRET_KEY_BASE }}
+          OPENPROJECT_COLLABORATION_SECRET: ${{ secrets.OPENPROJECT_COLLABORATION_SECRET }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OPENPROJECT_SECRET_KEY_BASE" ]; then
+            echo "ERROR: OPENPROJECT_SECRET_KEY_BASE secret is not set." >&2
+            exit 1
+          fi
+          ENV_FILE="$(mktemp)"
+          {
+            echo "IMAGE_NAME=${IMAGE_NAME}"
+            echo "IMAGE_TAG=${{ steps.meta.outputs.image_tag }}"
+            echo "APP_PORT=${APP_PORT}"
+            echo "APP_HTTPS_PORT=443"
+            echo "ASSETS_PATH=${ASSETS_PATH}"
+            echo "DOCKER_NETWORK_NAME=${DOCKER_NETWORK_NAME}"
+            echo "RAILS_ENV=production"
+            echo "SECRET_KEY_BASE=${OPENPROJECT_SECRET_KEY_BASE}"
+            echo "DATABASE_URL=postgresql://${DB_USER}:${OPENPROJECT_DB_PASSWORD}@host.docker.internal:5432/${DB_NAME}"
+            echo "OPENPROJECT_HOST_NAME=${OPENPROJECT_HOST_NAME}"
+            echo "OPENPROJECT_HOST__NAME=${OPENPROJECT_HOST_NAME}"
+            echo "OPENPROJECT_HTTPS=${OPENPROJECT_HTTPS}"
+            echo "OPENPROJECT_EDITION=standard"
+            echo "OPENPROJECT_DEFAULT__LANGUAGE=en"
+            echo "OPENPROJECT_RAILS__RELATIVE__URL__ROOT="
+            echo "OPENPROJECT_RAILS__CACHE__STORE=memcache"
+            echo "OPENPROJECT_CACHE__MEMCACHE__SERVER=cache:11211"
+            if [ -n "${OPENPROJECT_COLLABORATION_SECRET:-}" ]; then
+              echo "OPENPROJECT_COLLABORATIVE__EDITING__HOCUSPOCUS__SECRET=${OPENPROJECT_COLLABORATION_SECRET}"
+            fi
+            if [ -n "${SMTP_USERNAME:-}" ] && [ -n "${SMTP_PASSWORD:-}" ]; then
+              echo "OPENPROJECT_EMAIL__DELIVERY__METHOD=smtp"
+              echo "OPENPROJECT_SMTP__USER__NAME=${SMTP_USERNAME}"
+              echo "OPENPROJECT_SMTP__PASSWORD=${SMTP_PASSWORD}"
+              echo "OPENPROJECT_SMTP__AUTHENTICATION=plain"
+              echo "OPENPROJECT_SMTP__ENABLE__STARTTLS__AUTO=true"
+            fi
+          } >"$ENV_FILE"
+          chmod 600 "$ENV_FILE"
+          # shellcheck disable=SC2086
+          scp $ssh_opts "$ENV_FILE" "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/.env.prod"
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod 600 '${DEPLOY_PATH}/.env.prod'"
+          shred -u "$ENV_FILE" 2>/dev/null || rm -f "$ENV_FILE"
+
+      - name: Validate Docker Compose
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && docker compose -f docker-compose.prod.yml --env-file .env.prod config" >/dev/null
+
+      - name: Deploy OpenProject
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' GIT_COMMIT='${{ github.sha }}' ./scripts/deploy.sh"
+
+      - name: Verify containers
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && docker compose -f docker-compose.prod.yml --env-file .env.prod ps"
+
+      - name: Verify database connection
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && docker compose -f docker-compose.prod.yml --env-file .env.prod exec -T -e WAIT_FOR_DB_TIMEOUT_SECONDS=60 web ./docker/prod/wait-for-db"
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' ./scripts/health-check.sh"
+
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f /tmp/openproject-image.tar.gz
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "rm -f /tmp/openproject-image.tar.gz" || true
+
+      # ---------------------------------------------------------------
+      - name: Collect failure diagnostics and roll back
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "::group::docker compose ps"
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && docker compose -f docker-compose.prod.yml --env-file .env.prod ps -a" || true
+          echo "::endgroup::"
+          echo "::group::Attempting rollback to previous image"
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' ./scripts/rollback.sh" || echo "Rollback did not complete cleanly - manual intervention required."
+          echo "::endgroup::"
+          echo "::group::Post-rollback health check"
+          # shellcheck disable=SC2086
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' ./scripts/health-check.sh" || echo "Post-rollback health check failed - manual intervention required."
+          echo "::endgroup::"

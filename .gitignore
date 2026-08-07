@@ -147,3 +147,11 @@ acme.json
 
 # Generated seeders crowdin source file
 **/config/locales/en.seeders.yml
+
+# Production deployment secrets/artifacts (see deploy/README.md) - the real
+# file is generated on the server by .github/workflows/deploy.yml and must
+# never be committed. Only deploy/.env.prod.example (placeholders) is tracked.
+deploy/.env.prod
+deploy/nginx/openproject.conf
+deploy/nginx/certs/
+deploy/*.tar.gz

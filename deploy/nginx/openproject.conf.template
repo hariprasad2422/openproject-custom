@@ -1,0 +1,27 @@
+# Reverse proxy in front of the OpenProject "web" container.
+#
+# Rendered to /opt/openproject/nginx/openproject.conf by deploy.sh via
+# envsubst, using OPENPROJECT_HOST_NAME from .env.prod. HTTPS is optional:
+# when TLS certs are present at /opt/openproject/nginx/certs/{fullchain,privkey}.pem
+# and OPENPROJECT_HTTPS=true, the 443 server block below is used instead of
+# the default HTTP-only block. See deploy/README.md for enabling it.
+
+upstream openproject_web {
+	server web:8080;
+}
+
+server {
+	listen 80;
+	server_name ${OPENPROJECT_HOST_NAME};
+
+	client_max_body_size 100m;
+	proxy_read_timeout 300s;
+
+	location / {
+		proxy_pass http://openproject_web;
+		proxy_set_header Host $host;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $scheme;
+	}
+}
